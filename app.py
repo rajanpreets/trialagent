@@ -5,27 +5,25 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
 import json
+import re # Import the regular expression library
 from groq import Groq
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List, Optional
 
 # --- 1. CONFIGURATION ---
 try:
-    # Set up the Groq API key from Streamlit secrets
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
     client = Groq(api_key=GROQ_API_KEY)
 except (KeyError, FileNotFoundError):
     st.error("Groq API Key not found. Please add it to your Streamlit secrets.")
     st.stop()
     
-# Model configuration
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 LLM_MODEL_NAME = 'llama3-8b-8192'
 
 # --- 2. DATA AND MODEL LOADING ---
 @st.cache_resource
 def load_models_and_data(faiss_file_obj, metadata_file_obj):
-    """Loads models and data from user-uploaded file objects."""
     temp_dir = "temp_data"
     os.makedirs(temp_dir, exist_ok=True)
     faiss_path = os.path.join(temp_dir, faiss_file_obj.name)
@@ -40,13 +38,9 @@ def load_models_and_data(faiss_file_obj, metadata_file_obj):
 
 # --- 3. THE UNRESTRICTED RETRIEVER TOOL ---
 def search_clinical_trials(query: str, filters: dict):
-    """
-    Performs an exhaustive search to find ALL matching trials, returning them sorted by relevance.
-    """
     embedding_model, search_index, metadata_df = st.session_state.models_and_data
     working_df = metadata_df
 
-    # Apply structured filters first
     if filters:
         for column, value in filters.items():
             actual_col = next((c for c in metadata_df.columns if column in c.lower()), None)
@@ -56,21 +50,13 @@ def search_clinical_trials(query: str, filters: dict):
     if working_df.empty:
         return pd.DataFrame()
 
-    # If there's a semantic query, rank the ENTIRE filtered set by relevance
     if query:
-        # Get the original indices of the filtered rows
         filtered_indices = working_df.index.to_numpy()
         query_vector = embedding_model.encode([query]).astype('float32')
-        
-        # Search the entire index to get a full relevance ranking
         distances, all_indices = search_index.search(query_vector, k=search_index.ntotal)
-        
-        # Intersect the fully ranked list with our filtered list to get a ranked, filtered list
         ranked_filtered_indices = [idx for idx in all_indices[0] if idx in filtered_indices]
-        
         results_df = metadata_df.iloc[ranked_filtered_indices]
     else:
-        # If no semantic query, return all filtered results
         results_df = working_df
         
     return results_df
@@ -78,7 +64,7 @@ def search_clinical_trials(query: str, filters: dict):
 # --- 4. LANGGRAPH AGENT SETUP ---
 class AgentState(TypedDict):
     question: str
-    k_summarize: int # How many to summarize in detail
+    k_summarize: int
     plan: dict
     retrieved_df: Optional[pd.DataFrame]
     total_found: int
@@ -88,7 +74,7 @@ class AgentState(TypedDict):
 
 # --- Agent Nodes ---
 def planner_node(state: AgentState):
-    """Decomposes the user query with a more robust prompt."""
+    """Decomposes the user query and robustly extracts the JSON plan."""
     prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
 
     Identify filters like: sponsor, status, phase. The rest is the semantic query.
@@ -105,7 +91,16 @@ def planner_node(state: AgentState):
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
     )
-    plan = json.loads(chat_completion.choices[0].message.content)
+    response_text = chat_completion.choices[0].message.content
+    
+    # --- ROBUST JSON PARSING ---
+    # Use regex to find a JSON object within the response text
+    json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if json_match:
+        plan = json.loads(json_match.group(0))
+    else:
+        raise ValueError(f"Planner node did not return a valid JSON object. Raw response: {response_text}")
+
     return {"plan": plan}
 
 def retrieve_node(state: AgentState):
@@ -192,16 +187,13 @@ csv_file = st.sidebar.file_uploader("Upload CSV Metadata", type=["csv"])
 
 # Main App Logic
 if faiss_file and csv_file:
-    # Search settings appear only after files are uploaded
     st.sidebar.header("2. Search Settings")
     k_summarize_results = st.sidebar.slider("Number of top trials to summarize:", 1, 50, 10)
     
-    # Load data once and store it
     if 'models_and_data' not in st.session_state:
         st.session_state.models_and_data = load_models_and_data(faiss_file, csv_file)
     st.sidebar.success("Data loaded!")
 
-    # Initialize or display chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.retrieved_data = None
@@ -210,7 +202,6 @@ if faiss_file and csv_file:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Handle user input
     if prompt := st.chat_input("Ask a complex question about clinical trials..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
@@ -224,7 +215,8 @@ if faiss_file and csv_file:
                     st.session_state.retrieved_data = final_state.get("retrieved_df")
                     st.markdown(response)
                 except Exception as e:
-                    # This will show the actual error on the screen for easier debugging
+                    # --- IMPROVED ERROR HANDLING ---
+                    # This will now show the REAL error on the screen for easier debugging
                     st.error(f"An error occurred during the agent run: {e}")
                     print(f"An error occurred: {e}")
         
@@ -232,7 +224,6 @@ if faiss_file and csv_file:
             st.session_state.messages.append({"role": "assistant", "content": response})
             st.rerun()
 
-    # Display full details and download button if data was retrieved
     if st.session_state.get("retrieved_data") is not None and not st.session_state.retrieved_data.empty:
         st.markdown("---")
         st.subheader(f"Retrieved Trial Details (Top {k_summarize_results} of {len(st.session_state.retrieved_data)} shown)")
@@ -248,11 +239,9 @@ if faiss_file and csv_file:
             file_name="clinical_trial_results.csv",
             mime="text/csv",
         )
-
-        # Only show expanders for the top k summarized results to keep the UI fast
+        
         for index, row in st.session_state.retrieved_data.head(k_summarize_results).iterrows():
             with st.expander(f"**{row.get('protocolSection.identificationModule.nctId', 'N/A')}**: {row.get('protocolSection.identificationModule.officialTitle', 'N/A')}"):
                 st.dataframe(row)
 else:
-    # This is the initial view before files are uploaded
     st.info("Please upload your data files in the sidebar to begin.")
