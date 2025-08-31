@@ -5,7 +5,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
 import json
-import re # Import the regular expression library
+import re
 from groq import Groq
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List, Optional
@@ -24,7 +24,6 @@ LLM_MODEL_NAME = 'llama3-8b-8192'
 # --- 2. DATA AND MODEL LOADING ---
 @st.cache_resource
 def load_models_and_data(faiss_file_obj, metadata_file_obj):
-    """Loads models and data from user-uploaded file objects."""
     temp_dir = "temp_data"
     os.makedirs(temp_dir, exist_ok=True)
     faiss_path = os.path.join(temp_dir, faiss_file_obj.name)
@@ -39,9 +38,6 @@ def load_models_and_data(faiss_file_obj, metadata_file_obj):
 
 # --- 3. THE UNRESTRICTED RETRIEVER TOOL ---
 def search_clinical_trials(query: str, filters: dict):
-    """
-    Performs an exhaustive search, now with support for list-based filters (OR conditions).
-    """
     embedding_model, search_index, metadata_df = st.session_state.models_and_data
     working_df = metadata_df
 
@@ -85,7 +81,7 @@ class AgentState(TypedDict):
 def planner_node(state: AgentState):
     """
     Decomposes the user query and robustly extracts the JSON plan.
-    Includes a self-healing retry mechanism.
+    This version is highly defensive against malformed AI responses.
     """
     prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
 
@@ -96,31 +92,29 @@ def planner_node(state: AgentState):
     CRITICAL: Your entire response must be ONLY the raw JSON object and nothing else. Do not include any introductory text, explanations, or markdown code fences like ```json.
     """
     
-    for i in range(2): # Allow for one retry
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
-            )
-            response_text = chat_completion.choices[0].message.content
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
+        )
+        response_text = chat_completion.choices[0].message.content
+        
+        # --- Defensive JSON Parsing ---
+        # Find the first '{' and the last '}' to extract the JSON object
+        start_index = response_text.find('{')
+        end_index = response_text.rfind('}') + 1
+        
+        if start_index == -1 or end_index == 0:
+            raise ValueError(f"No JSON object found in the LLM response. Raw response: {response_text}")
             
-            # Use regex to be extra sure we only get the JSON part
-            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-            if json_match:
-                plan = json.loads(json_match.group(0))
-                return {"plan": plan}
-            else:
-                raise ValueError("No JSON object found in the response.")
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Planner attempt {i+1} failed: {e}. Retrying...")
-            # On failure, create a corrective prompt
-            prompt = f"""Your previous response was not a valid JSON object. Please correct it.
-            PREVIOUS RESPONSE:
-            {response_text}
-            
-            CORRECT RESPONSE (JSON ONLY):
-            """
-            if i == 1: # If it fails on the second try, raise the error
-                raise e
+        json_text = response_text[start_index:end_index]
+        plan = json.loads(json_text)
+        return {"plan": plan}
+
+    except Exception as e:
+        # Re-raise the exception to be caught by the main error handler
+        print(f"FATAL: Planner node failed with error: {e}")
+        raise e
+
 
 def retrieve_node(state: AgentState):
     """Retrieves ALL documents based on the plan."""
