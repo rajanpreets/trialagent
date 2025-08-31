@@ -37,7 +37,7 @@ def load_models_and_data(faiss_file_obj, metadata_file_obj):
         metadata_df = pd.read_csv(metadata_path)
     return embedding_model, search_index, metadata_df
 
-# --- 3. THE UPGRADED RETRIEVER TOOL ---
+# --- 3. THE UNRESTRICTED RETRIEVER TOOL ---
 def search_clinical_trials(query: str, filters: dict):
     """
     Performs an exhaustive search, now with support for list-based filters (OR conditions).
@@ -45,27 +45,20 @@ def search_clinical_trials(query: str, filters: dict):
     embedding_model, search_index, metadata_df = st.session_state.models_and_data
     working_df = metadata_df
 
-    # Apply structured filters first
     if filters:
         for column, value in filters.items():
             actual_col = next((c for c in metadata_df.columns if column in c.lower()), None)
             if actual_col and value:
-                # --- NEW LOGIC TO HANDLE LISTS ---
                 if isinstance(value, list):
-                    # Create a regex pattern: 'value1|value2|value3' for an OR condition
-                    # We use re.escape to safely handle special characters in values
                     pattern = '|'.join(map(re.escape, value))
-                    if not pattern: continue # Skip if list is empty
+                    if not pattern: continue
                 else:
-                    # Keep original behavior for simple string values
                     pattern = re.escape(str(value))
-
                 working_df = working_df[working_df[actual_col].str.contains(pattern, case=False, na=False, regex=True)]
 
     if working_df.empty:
         return pd.DataFrame()
 
-    # If there's a semantic query, rank the ENTIRE filtered set by relevance
     if query:
         filtered_indices = working_df.index.to_numpy()
         query_vector = embedding_model.encode([query]).astype('float32')
@@ -90,26 +83,44 @@ class AgentState(TypedDict):
 
 # --- Agent Nodes ---
 def planner_node(state: AgentState):
-    """Decomposes the user query."""
+    """
+    Decomposes the user query and robustly extracts the JSON plan.
+    Includes a self-healing retry mechanism.
+    """
     prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
 
     Identify filters like: sponsor, status, phase. The status "ongoing" can mean ["Recruiting", "Active, not recruiting", "Enrolling by invitation"]. The rest is the semantic query.
 
     User Question: "{state['question']}"
 
-    Provide your answer ONLY as a valid JSON object with keys "query" and "filters".
-    Example: {{"query": "lung cancer", "filters": {{"sponsor": "pfizer", "status": "recruiting"}}}}
+    CRITICAL: Your entire response must be ONLY the raw JSON object and nothing else. Do not include any introductory text, explanations, or markdown code fences like ```json.
     """
-    chat_completion = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
-    )
-    response_text = chat_completion.choices[0].message.content
-    json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-    if json_match:
-        plan = json.loads(json_match.group(0))
-    else:
-        raise ValueError(f"Planner node did not return a valid JSON object. Raw response: {response_text}")
-    return {"plan": plan}
+    
+    for i in range(2): # Allow for one retry
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
+            )
+            response_text = chat_completion.choices[0].message.content
+            
+            # Use regex to be extra sure we only get the JSON part
+            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            if json_match:
+                plan = json.loads(json_match.group(0))
+                return {"plan": plan}
+            else:
+                raise ValueError("No JSON object found in the response.")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Planner attempt {i+1} failed: {e}. Retrying...")
+            # On failure, create a corrective prompt
+            prompt = f"""Your previous response was not a valid JSON object. Please correct it.
+            PREVIOUS RESPONSE:
+            {response_text}
+            
+            CORRECT RESPONSE (JSON ONLY):
+            """
+            if i == 1: # If it fails on the second try, raise the error
+                raise e
 
 def retrieve_node(state: AgentState):
     """Retrieves ALL documents based on the plan."""
@@ -159,7 +170,7 @@ def final_summary_node(state: AgentState):
     final_summary = chat_completion.choices[0].message.content
     return {"final_answer": final_summary}
 
-# --- Conditional Edges ---
+# --- Conditional Edges & Graph Definition ---
 def should_summarize(state: AgentState):
     return "end" if state["retrieved_df"] is None or state["retrieved_df"].empty else "summarize"
 
@@ -169,13 +180,11 @@ def more_batches(state: AgentState):
     else:
         return "continue_batching"
 
-# --- Graph Definition ---
 workflow = StateGraph(AgentState)
 workflow.add_node("planner", planner_node)
 workflow.add_node("retriever", retrieve_node)
 workflow.add_node("batch_summarizer", batch_summarize_node)
 workflow.add_node("final_summarizer", final_summary_node)
-
 workflow.set_entry_point("planner")
 workflow.add_edge("planner", "retriever")
 workflow.add_conditional_edges("retriever", should_summarize, {"end": END, "summarize": "batch_summarizer"})
@@ -188,12 +197,10 @@ st.set_page_config(layout="wide")
 st.title("Advanced Clinical Trials Research Assistant 🔬")
 st.info("Powered by LangGraph and Groq (Llama3-8B)")
 
-# Sidebar
 st.sidebar.header("1. Upload Your Data")
 faiss_file = st.sidebar.file_uploader("Upload FAISS Index", type=["faiss"])
 csv_file = st.sidebar.file_uploader("Upload CSV Metadata", type=["csv"])
 
-# Main App Logic
 if faiss_file and csv_file:
     st.sidebar.header("2. Search Settings")
     k_summarize_results = st.sidebar.slider("Number of top trials to summarize:", 1, 50, 10)
