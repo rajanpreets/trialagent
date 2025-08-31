@@ -2,7 +2,6 @@ streamlit
 pandas
 faiss-cpu
 sentence-transformers
-requests
-google-generativeai
-langgraph
 numpy
+langgraph
+groq
