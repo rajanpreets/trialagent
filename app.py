@@ -4,7 +4,6 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
-import requests
 import google.generativeai as genai
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List
@@ -19,47 +18,38 @@ except (KeyError, FileNotFoundError):
     st.error("Google API Key not found. Please add it to your Streamlit secrets.")
     st.stop()
     
-# --- UPDATE THESE URLS ---
-# Replace with the direct RAW links to your files on GitHub
-FAISS_INDEX_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/optimized_trial_index.faiss"
-METADATA_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/trial_metadata.csv"
-
 # Model configuration
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-GENERATIVE_MODEL_NAME = 'gemini-1.5-pro-latest' # Using the latest powerful model available
+GENERATIVE_MODEL_NAME = 'gemini-1.5-pro-latest'
 
-# --- 2. DATA AND MODEL LOADING (CACHED) ---
+# --- 2. DATA AND MODEL LOADING (FROM UPLOAD) ---
 
 @st.cache_resource
-def load_data_and_models(index_url, metadata_url):
+def load_models_and_data(faiss_file_obj, metadata_file_obj):
     """
-    Downloads data from GitHub and loads models into memory.
-    This function is cached to run only once.
+    Loads models and data from user-uploaded file objects.
+    This function is cached to run only once per file upload session.
     """
-    local_data_path = "data"
-    if not os.path.exists(local_data_path):
-        os.makedirs(local_data_path)
+    # Create a temporary directory to save uploaded files
+    temp_dir = "temp_data"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
 
-    local_index_path = os.path.join(local_data_path, "optimized_trial_index.faiss")
-    local_metadata_path = os.path.join(local_data_path, "trial_metadata.csv")
+    # Save the uploaded files to the temporary directory
+    faiss_path = os.path.join(temp_dir, faiss_file_obj.name)
+    metadata_path = os.path.join(temp_dir, metadata_file_obj.name)
 
-    # Download files from GitHub if they don't exist locally
-    with st.spinner("Downloading data files from GitHub (first time only)..."):
-        if not os.path.exists(local_index_path):
-            r = requests.get(index_url)
-            with open(local_index_path, 'wb') as f:
-                f.write(r.content)
-        
-        if not os.path.exists(local_metadata_path):
-            r = requests.get(metadata_url)
-            with open(local_metadata_path, 'wb') as f:
-                f.write(r.content)
+    with open(faiss_path, "wb") as f:
+        f.write(faiss_file_obj.getbuffer())
     
-    # Load models and data into memory
-    with st.spinner("Loading models and search index..."):
+    with open(metadata_path, "wb") as f:
+        f.write(metadata_file_obj.getbuffer())
+
+    # Load models and data from the temporary local paths
+    with st.spinner("Loading models and search index... This may take a moment."):
         embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        search_index = faiss.read_index(local_index_path)
-        metadata_df = pd.read_csv(local_metadata_path)
+        search_index = faiss.read_index(faiss_path)
+        metadata_df = pd.read_csv(metadata_path)
         
     return embedding_model, search_index, metadata_df
 
@@ -67,6 +57,7 @@ def load_data_and_models(index_url, metadata_url):
 
 def search_clinical_trials(query: str, k: int = 5):
     """The tool our agent will use to search for relevant trials."""
+    # Retrieve loaded models from Streamlit's session state
     embedding_model, search_index, metadata_df = st.session_state.models_and_data
     
     query_vector = embedding_model.encode([query]).astype('float32')
@@ -84,6 +75,7 @@ def search_clinical_trials(query: str, k: int = 5):
             f"Trial ID: {row.get('protocolSection.identificationModule.nctId', 'N/A')}\n"
             f"Title: {row.get('protocolSection.identificationModule.officialTitle', 'N/A')}\n"
             f"Status: {row.get('protocolSection.statusModule.overallStatus', 'N/A')}\n"
+            # Making the summary optional if the column doesn't exist
             f"Summary: {row.get('protocolSection.descriptionModule.briefSummary', 'N/A')}\n"
         )
         formatted_results.append(result)
@@ -100,14 +92,12 @@ class AgentState(TypedDict):
 # Define the nodes for the graph
 def retrieve_node(state: AgentState):
     """Node that calls our search tool."""
-    print("---NODE: RETRIEVE---")
     question = state["question"]
     documents = search_clinical_trials(question)
     return {"documents": documents}
 
 def generate_node(state: AgentState):
     """Node that generates the final answer using Gemini."""
-    print("---NODE: GENERATE---")
     question = state["question"]
     documents = state["documents"]
     
@@ -127,13 +117,11 @@ def generate_node(state: AgentState):
 
 def fallback_node(state: AgentState):
     """Node to handle cases where no documents are found."""
-    print("---NODE: FALLBACK---")
     return {"answer": "I'm sorry, but I couldn't find any relevant clinical trials for your query. Please try rephrasing your question."}
 
 # Define the conditional edge
 def should_generate(state: AgentState):
     """Determines whether to generate an answer or use the fallback."""
-    print("---EDGE: CONDITIONAL---")
     if state["documents"] and "No relevant trials found." not in state["documents"]:
         return "generate"
     else:
@@ -146,11 +134,7 @@ workflow.add_node("generate", generate_node)
 workflow.add_node("fallback", fallback_node)
 
 workflow.set_entry_point("retrieve")
-workflow.add_conditional_edges(
-    "retrieve",
-    should_generate,
-    {"generate": "generate", "fallback": "fallback"},
-)
+workflow.add_conditional_edges("retrieve", should_generate, {"generate": "generate", "fallback": "fallback"})
 workflow.add_edge("generate", END)
 workflow.add_edge("fallback", END)
 
@@ -158,38 +142,51 @@ app_graph = workflow.compile()
 
 # --- 5. STREAMLIT UI ---
 
+st.set_page_config(layout="wide")
 st.title("Clinical Trials Search Agent 🩺")
 st.info("Powered by LangGraph and Gemini 1.5 Pro")
 
-# Load models and data only once and store in session state
-if 'models_and_data' not in st.session_state:
-    st.session_state.models_and_data = load_data_and_models(FAISS_INDEX_URL, METADATA_URL)
+# --- Sidebar for File Uploads ---
+st.sidebar.header("1. Upload Your Data")
+faiss_file = st.sidebar.file_uploader("Upload FAISS Index File (`.faiss`)", type=["faiss"])
+csv_file = st.sidebar.file_uploader("Upload CSV Metadata File (`.csv`)", type=["csv"])
 
-# Initialize chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display chat messages from history on app rerun
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Accept user input
-if prompt := st.chat_input("Ask about clinical trials..."):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    # Display user message in chat message container
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            # Run the LangGraph agent
-            inputs = {"question": prompt}
-            final_state = app_graph.invoke(inputs)
-            response = final_state.get("answer", "An error occurred.")
-            st.markdown(response)
+# Main chat interface logic
+if faiss_file and csv_file:
+    # Load data and models if they are not already in the session state
+    if 'models_and_data' not in st.session_state:
+        st.session_state.models_and_data = load_models_and_data(faiss_file, csv_file)
     
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.sidebar.success("Data loaded successfully! You can now ask questions.")
+
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Accept user input
+    if prompt := st.chat_input("Ask about clinical trials..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                # Run the LangGraph agent
+                inputs = {"question": prompt}
+                final_state = app_graph.invoke(inputs)
+                response = final_state.get("answer", "An error occurred.")
+                st.markdown(response)
+        
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": response})
+else:
+    # Show this message if files are not uploaded yet
+    st.info("Please upload your FAISS index and CSV metadata files in the sidebar to begin.")
