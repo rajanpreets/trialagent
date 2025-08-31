@@ -24,6 +24,7 @@ LLM_MODEL_NAME = 'llama3-8b-8192'
 # --- 2. DATA AND MODEL LOADING ---
 @st.cache_resource
 def load_models_and_data(faiss_file_obj, metadata_file_obj):
+    """Loads models and data from user-uploaded file objects."""
     temp_dir = "temp_data"
     os.makedirs(temp_dir, exist_ok=True)
     faiss_path = os.path.join(temp_dir, faiss_file_obj.name)
@@ -36,20 +37,35 @@ def load_models_and_data(faiss_file_obj, metadata_file_obj):
         metadata_df = pd.read_csv(metadata_path)
     return embedding_model, search_index, metadata_df
 
-# --- 3. THE UNRESTRICTED RETRIEVER TOOL ---
+# --- 3. THE UPGRADED RETRIEVER TOOL ---
 def search_clinical_trials(query: str, filters: dict):
+    """
+    Performs an exhaustive search, now with support for list-based filters (OR conditions).
+    """
     embedding_model, search_index, metadata_df = st.session_state.models_and_data
     working_df = metadata_df
 
+    # Apply structured filters first
     if filters:
         for column, value in filters.items():
             actual_col = next((c for c in metadata_df.columns if column in c.lower()), None)
             if actual_col and value:
-                working_df = working_df[working_df[actual_col].str.contains(value, case=False, na=False)]
+                # --- NEW LOGIC TO HANDLE LISTS ---
+                if isinstance(value, list):
+                    # Create a regex pattern: 'value1|value2|value3' for an OR condition
+                    # We use re.escape to safely handle special characters in values
+                    pattern = '|'.join(map(re.escape, value))
+                    if not pattern: continue # Skip if list is empty
+                else:
+                    # Keep original behavior for simple string values
+                    pattern = re.escape(str(value))
+
+                working_df = working_df[working_df[actual_col].str.contains(pattern, case=False, na=False, regex=True)]
 
     if working_df.empty:
         return pd.DataFrame()
 
+    # If there's a semantic query, rank the ENTIRE filtered set by relevance
     if query:
         filtered_indices = working_df.index.to_numpy()
         query_vector = embedding_model.encode([query]).astype('float32')
@@ -74,33 +90,25 @@ class AgentState(TypedDict):
 
 # --- Agent Nodes ---
 def planner_node(state: AgentState):
-    """Decomposes the user query and robustly extracts the JSON plan."""
+    """Decomposes the user query."""
     prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
 
-    Identify filters like: sponsor, status, phase. The rest is the semantic query.
+    Identify filters like: sponsor, status, phase. The status "ongoing" can mean ["Recruiting", "Active, not recruiting", "Enrolling by invitation"]. The rest is the semantic query.
 
     User Question: "{state['question']}"
 
-    CRITICAL: Your entire response must be ONLY the raw JSON object and nothing else. Do not include any introductory text, explanations, or markdown code fences like ```json.
-
-    Example:
-    User Question: "recruiting pfizer trials for lung cancer"
-    Your Response:
-    {{"query": "lung cancer", "filters": {{"sponsor": "pfizer", "status": "recruiting"}}}}
+    Provide your answer ONLY as a valid JSON object with keys "query" and "filters".
+    Example: {{"query": "lung cancer", "filters": {{"sponsor": "pfizer", "status": "recruiting"}}}}
     """
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
     )
     response_text = chat_completion.choices[0].message.content
-    
-    # --- ROBUST JSON PARSING ---
-    # Use regex to find a JSON object within the response text
     json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
     if json_match:
         plan = json.loads(json_match.group(0))
     else:
         raise ValueError(f"Planner node did not return a valid JSON object. Raw response: {response_text}")
-
     return {"plan": plan}
 
 def retrieve_node(state: AgentState):
@@ -215,8 +223,6 @@ if faiss_file and csv_file:
                     st.session_state.retrieved_data = final_state.get("retrieved_df")
                     st.markdown(response)
                 except Exception as e:
-                    # --- IMPROVED ERROR HANDLING ---
-                    # This will now show the REAL error on the screen for easier debugging
                     st.error(f"An error occurred during the agent run: {e}")
                     print(f"An error occurred: {e}")
         
