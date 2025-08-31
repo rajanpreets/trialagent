@@ -11,12 +11,14 @@ from typing import TypedDict, List, Optional
 
 # --- 1. CONFIGURATION ---
 try:
+    # Set up the Groq API key from Streamlit secrets
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
     client = Groq(api_key=GROQ_API_KEY)
 except (KeyError, FileNotFoundError):
     st.error("Groq API Key not found. Please add it to your Streamlit secrets.")
     st.stop()
     
+# Model configuration
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 LLM_MODEL_NAME = 'llama3-8b-8192'
 
@@ -56,10 +58,8 @@ def search_clinical_trials(query: str, filters: dict):
 
     # If there's a semantic query, rank the ENTIRE filtered set by relevance
     if query:
-        # Get the original indices and vectors for the filtered items
+        # Get the original indices of the filtered rows
         filtered_indices = working_df.index.to_numpy()
-        # We need the original embeddings to re-rank. This assumes they are accessible or stored.
-        # For simplicity here, we search the full index and then filter.
         query_vector = embedding_model.encode([query]).astype('float32')
         
         # Search the entire index to get a full relevance ranking
@@ -185,15 +185,19 @@ st.info("Powered by LangGraph and Groq (Llama3-8B)")
 st.sidebar.header("1. Upload Your Data")
 faiss_file = st.sidebar.file_uploader("Upload FAISS Index", type=["faiss"])
 csv_file = st.sidebar.file_uploader("Upload CSV Metadata", type=["csv"])
-st.sidebar.header("2. Search Settings")
-k_summarize_results = st.sidebar.slider("Number of top trials to summarize:", 1, 50, 10)
 
 # Main App Logic
 if faiss_file and csv_file:
+    # Search settings appear only after files are uploaded
+    st.sidebar.header("2. Search Settings")
+    k_summarize_results = st.sidebar.slider("Number of top trials to summarize:", 1, 50, 10)
+    
+    # Load data once and store it
     if 'models_and_data' not in st.session_state:
         st.session_state.models_and_data = load_models_and_data(faiss_file, csv_file)
     st.sidebar.success("Data loaded!")
 
+    # Initialize or display chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.retrieved_data = None
@@ -202,6 +206,7 @@ if faiss_file and csv_file:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # Handle user input
     if prompt := st.chat_input("Ask a complex question about clinical trials..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
@@ -244,4 +249,5 @@ if faiss_file and csv_file:
             with st.expander(f"**{row.get('protocolSection.identificationModule.nctId', 'N/A')}**: {row.get('protocolSection.identificationModule.officialTitle', 'N/A')}"):
                 st.dataframe(row)
 else:
+    # This is the initial view before files are uploaded
     st.info("Please upload your data files in the sidebar to begin.")
