@@ -20,7 +20,7 @@ except (KeyError, FileNotFoundError):
     
 # Model configuration
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-GENERATIVE_MODEL_NAME = 'gemini-1.5-pro-latest'
+GENERATIVE_MODEL_NAME = 'gemini-2.5-pro'
 
 # --- 2. DATA AND MODEL LOADING (FROM UPLOAD) ---
 
