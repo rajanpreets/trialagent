@@ -88,15 +88,19 @@ class AgentState(TypedDict):
 
 # --- Agent Nodes ---
 def planner_node(state: AgentState):
-    """Decomposes the user query."""
+    """Decomposes the user query with a more robust prompt."""
     prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
 
     Identify filters like: sponsor, status, phase. The rest is the semantic query.
 
     User Question: "{state['question']}"
 
-    Provide your answer ONLY as a valid JSON object with keys "query" and "filters".
-    Example: {{"query": "lung cancer", "filters": {{"sponsor": "pfizer", "status": "recruiting"}}}}
+    CRITICAL: Your entire response must be ONLY the raw JSON object and nothing else. Do not include any introductory text, explanations, or markdown code fences like ```json.
+
+    Example:
+    User Question: "recruiting pfizer trials for lung cancer"
+    Your Response:
+    {{"query": "lung cancer", "filters": {{"sponsor": "pfizer", "status": "recruiting"}}}}
     """
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
@@ -220,7 +224,8 @@ if faiss_file and csv_file:
                     st.session_state.retrieved_data = final_state.get("retrieved_df")
                     st.markdown(response)
                 except Exception as e:
-                    st.error("An error occurred. The Groq API may be busy or an issue occurred with the request. Please try again.")
+                    # This will show the actual error on the screen for easier debugging
+                    st.error(f"An error occurred during the agent run: {e}")
                     print(f"An error occurred: {e}")
         
         if 'response' in locals() and response:
