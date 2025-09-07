@@ -19,7 +19,7 @@ except (KeyError, FileNotFoundError):
     st.stop()
     
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-LLM_MODEL_NAME = 'llama3-8b-8192'
+LLM_MODEL_NAME = 'openai/gpt-oss-120b'
 
 # --- 2. DATA AND MODEL LOADING ---
 @st.cache_resource
