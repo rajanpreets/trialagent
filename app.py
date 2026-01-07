@@ -40,102 +40,130 @@ async def get_chictr_data_async(chictr_id):
         )
         page = await context.new_page()
         
-        # --- MANUAL STEALTH REPLACEMENT ---
-        # This replaces playwright-stealth to prevent the TypeError
+        # Manual Stealth
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
         """)
         
         try:
             await page.goto(url, wait_until="networkidle", timeout=60000)
             html_content = await page.content()
-            await browser.close()
             
             soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract Title for the monitored_trials table
+            title_tag = soup.find('p', class_='en')
+            trial_name = title_tag.get_text(strip=True) if title_tag else "Unknown Trial"
+            
+            # Clean Chinese text tags
             for cn_tag in soup.find_all(class_='cn'): 
                 cn_tag.decompose()
 
-            results = {
-                "metadata": {
-                    "proj_id": chictr_id,
-                    "scraped_at": "2026-01-07",
-                    "hash": hashlib.sha256(html_content.encode()).hexdigest()
-                },
-                "fields": {}
-            }
-
-            # Map fields
-            for row in soup.find_all('tr'):
-                label_cell = row.find('td', class_='left_title')
-                if label_cell:
-                    label = label_cell.get_text(strip=True).replace('：', '').replace(':', '')
-                    value_cell = label_cell.find_next_sibling('td')
-                    if value_cell:
-                        results["fields"][label] = value_cell.get_text(" ", strip=True)
-
-            # Smart Outcome Mapping
-            primary_outcomes = []
-            secondary_outcomes = []
-            for table in soup.select('.subitem table'):
-                text = table.get_text(" ", strip=True)
-                if "Outcome" in text:
-                    clean_val = re.sub(r'Outcome|Type|Measure.*', '', text).replace('：', '').strip()
-                    if "Primary" in text: primary_outcomes.append(clean_val)
-                    else: secondary_outcomes.append(clean_val)
+            raw_text = soup.get_text("\n", strip=True)
+            content_hash = hashlib.sha256(raw_text.encode()).hexdigest()
             
-            results["fields"]["Primary outcome"] = "\n".join(primary_outcomes) if primary_outcomes else "Not Found"
-            results["fields"]["Secondary outcome"] = "\n".join(secondary_outcomes) if secondary_outcomes else "Not Found"
-
-            # Sample Size
-            sample_size_matches = re.findall(r'Sample size\s*：\s*(\d+)', html_content)
-            if sample_size_matches:
-                results["fields"]["Target Sample Size"] = sample_size_matches[0]
-
-            return results, None
+            await browser.close()
+            return {"raw_content": raw_text, "hash": content_hash, "name": trial_name, "url": url}, None
         except Exception as e:
             return None, str(e)
 
 # --- DB HELPERS ---
-def handle_sync_process(chictr_id):
-    with st.spinner("⚡ Fetching live data from ChiCTR..."):
-        scraped_data, error = asyncio.run(get_chictr_data_async(chictr_id))
+
+def upsert_monitored_trial(chictr_id, trial_name, trial_url):
+    """Adds a new ID to monitored_trials if it doesn't exist."""
+    with psycopg2.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO monitored_trials (chictr_id, trial_name, trial_url)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (chictr_id) DO UPDATE SET trial_name = EXCLUDED.trial_name
+                RETURNING id;
+            """, (chictr_id, trial_name, trial_url))
+            return cur.fetchone()[0]
+
+def save_snapshot_if_changed(trial_internal_id, raw_content, content_hash):
+    """Saves to trial_snapshots only if the hash is new."""
+    with psycopg2.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT content_hash FROM trial_snapshots WHERE trial_id = %s ORDER BY scraped_at DESC LIMIT 1", (trial_internal_id,))
+            last_snap = cur.fetchone()
+
+            if not last_snap or last_snap[0] != content_hash:
+                cur.execute("INSERT INTO trial_snapshots (trial_id, raw_content, content_hash) VALUES (%s, %s, %s)", 
+                            (trial_internal_id, raw_content, content_hash))
+                conn.commit()
+                return True
+            return False
+
+def get_all_monitored_ids():
+    with psycopg2.connect(DB_URL) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT chictr_id FROM monitored_trials")
+            return [row['chictr_id'] for row in cur.fetchall()]
+
+# --- UI LOGIC ---
+
+async def run_sync_for_id(chictr_id):
+    data, error = await get_chictr_data_async(chictr_id)
+    if error:
+        st.error(f"Error syncing {chictr_id}: {error}")
+        return False
+    
+    # 1. Ensure it is in monitored_trials
+    internal_id = upsert_monitored_trial(chictr_id, data['name'], data['url'])
+    
+    # 2. Save snapshot
+    changed = save_snapshot_if_changed(internal_id, data['raw_content'], data['hash'])
+    return changed
+
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="ChiCTR HEOR Intel", layout="wide")
+st.title("🧪 Clinical Trial Protocol Intelligence")
+
+# Single ID Sync
+st.subheader("Add or Update Single ID")
+target_id = st.text_input("Enter ChiCTR ID (e.g., 297646)")
+
+if st.button("🔍 Sync Single ID"):
+    if target_id:
+        with st.spinner(f"Scraping {target_id}..."):
+            changed = asyncio.run(run_sync_for_id(target_id))
+            if changed:
+                st.success(f"✅ Changes detected and saved for {target_id}!")
+            else:
+                st.info(f"ℹ️ No changes for {target_id}.")
+    else:
+        st.warning("Please enter an ID.")
+
+st.divider()
+
+# Batch Sync
+st.subheader("Platform Controls")
+if st.button("🔄 Scrape All Monitored IDs"):
+    ids = get_all_monitored_ids()
+    if not ids:
+        st.warning("No IDs are currently monitored.")
+    else:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        if error:
-            st.error(f"Scrape error: {error}")
-            return False
+        for i, chictr_id in enumerate(ids):
+            status_text.text(f"Syncing {chictr_id} ({i+1}/{len(ids)})...")
+            asyncio.run(run_sync_for_id(chictr_id))
+            progress_bar.progress((i + 1) / len(ids))
+        
+        status_text.text("✅ All monitored IDs synced!")
+        st.balloons()
 
-        try:
-            with psycopg2.connect(DB_URL) as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT id FROM monitored_trials WHERE chictr_id = %s", (chictr_id,))
-                    trial = cur.fetchone()
-                    if not trial:
-                        st.error("This ID is not in your monitored list.")
-                        return False
-                    
-                    t_id = trial['id']
-                    new_hash = scraped_data['metadata']['hash']
-                    raw_text = json.dumps(scraped_data['fields'])
+st.divider()
 
-                    cur.execute("SELECT content_hash FROM trial_snapshots WHERE trial_id = %s ORDER BY scraped_at DESC LIMIT 1", (t_id,))
-                    last_snap = cur.fetchone()
+# Comparison View
+st.subheader("View Protocol Changes")
+compare_id = st.selectbox("Select ID to compare", options=[""] + get_all_monitored_ids())
 
-                    if last_snap and last_snap['content_hash'] == new_hash:
-                        st.info("✅ Database is already up to date.")
-                        return False
-                    else:
-                        cur.execute("INSERT INTO trial_snapshots (trial_id, raw_content, content_hash) VALUES (%s, %s, %s)", (t_id, raw_text, new_hash))
-                        conn.commit()
-                        st.success("🔔 New snapshot saved!")
-                        return True
-        except Exception as e:
-            st.error(f"Database error: {e}")
-            return False
-
-def get_recent_versions(chictr_id):
+if compare_id:
     with psycopg2.connect(DB_URL) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -144,41 +172,30 @@ def get_recent_versions(chictr_id):
                 JOIN monitored_trials m ON s.trial_id = m.id
                 WHERE m.chictr_id = %s
                 ORDER BY s.scraped_at DESC LIMIT 2
-            """, (chictr_id,))
-            return cur.fetchall()
+            """, (compare_id,))
+            history = cur.fetchall()
 
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="ChiCTR HEOR Tracker", layout="wide")
-st.title("🧪 ChiCTR Clinical Trial Intelligence")
+    if len(history) < 2:
+        st.warning("Not enough history for this ID yet. Sync it again later to see changes.")
+    else:
+        st.write(f"Comparing latest vs. snapshot from {history[1]['scraped_at']}")
+        diff = difflib.HtmlDiff().make_file(
+            history[1]['raw_content'].splitlines(),
+            history[0]['raw_content'].splitlines(),
+            context=True
+        )
+        st.components.v1.html(diff, height=600, scrolling=True)
 
-target_id = st.text_input("Enter ChiCTR ID", value="297646")
-c1, c2, _ = st.columns([1, 1, 4])
-
-with c1:
-    if st.button("🔍 Sync & Save"):
-        handle_sync_process(target_id)
-
-with c2:
-    if st.button("📜 View Changes"):
-        history = get_recent_versions(target_id)
-        if len(history) < 2:
-            st.warning("Insufficient history for comparison.")
-        else:
-            st.subheader(f"Diff: {history[1]['scraped_at'].strftime('%Y-%m-%d')} vs Today")
-            old_lines = json.dumps(json.loads(history[1]['raw_content']), indent=2).splitlines()
-            new_lines = json.dumps(json.loads(history[0]['raw_content']), indent=2).splitlines()
-            diff_html = difflib.HtmlDiff().make_file(old_lines, new_lines, context=True)
-            st.components.v1.html(diff_html, height=800, scrolling=True)
-
+# Sidebar
 with st.sidebar:
-    st.header("📊 Monitoring Portfolio")
+    st.header("📋 Monitored Portfolio")
     try:
         with psycopg2.connect(DB_URL) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT chictr_id, trial_name FROM monitored_trials")
+                cur.execute("SELECT chictr_id, trial_name FROM monitored_trials ORDER BY date_added DESC")
                 for item in cur.fetchall():
-                    st.write(f"**{item['chictr_id']}**")
-                    st.caption(item['trial_name'] or "Unnamed Study")
+                    st.markdown(f"**{item['chictr_id']}**")
+                    st.caption(item['trial_name'])
                     st.divider()
     except:
         st.write("Connecting...")
