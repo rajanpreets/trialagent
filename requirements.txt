@@ -1,7 +1,6 @@
 streamlit
-pandas
-faiss-cpu
-sentence-transformers
-numpy
-langgraph
-groq
+playwright
+playwright-stealth
+psycopg2-binary
+beautifulsoup4
+nest_asyncio
