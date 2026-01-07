@@ -10,40 +10,44 @@ from psycopg2.extras import RealDictCursor
 import difflib
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth
 import nest_asyncio
 
 # Initialize nested asyncio for Streamlit's environment
 nest_asyncio.apply()
 
-# --- DATABASE CONFIGURATION ---
-# Neon PostgreSQL Connection String
+# --- CONFIGURATION ---
 DB_URL = "postgresql://neondb_owner:npg_XU5awkQ1FOZW@ep-falling-field-adfv4ciy-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
 def ensure_playwright_browsers():
-    """Checks and installs Chromium if missing in cloud environments."""
+    """Ensures Chromium is installed in the cloud environment."""
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        st.error(f"Browser installation check failed: {e}")
+    except Exception:
+        pass
 
 async def get_chictr_data_async(chictr_id):
-    """Scraper logic using standard stealth integration."""
+    """Scraper logic with Manual Stealth to avoid TypeErrors."""
     ensure_playwright_browsers()
     url = f"https://www.chictr.org.cn/showprojEN.html?proj={chictr_id}"
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True, 
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
         
-        # Apply stealth to bypass bot detection
-        stealth(page)
+        # --- MANUAL STEALTH REPLACEMENT ---
+        # This replaces playwright-stealth to prevent the TypeError
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
         
         try:
             await page.goto(url, wait_until="networkidle", timeout=60000)
@@ -51,11 +55,9 @@ async def get_chictr_data_async(chictr_id):
             await browser.close()
             
             soup = BeautifulSoup(html_content, 'html.parser')
-            # Clean Chinese text tags
             for cn_tag in soup.find_all(class_='cn'): 
                 cn_tag.decompose()
 
-            # Structure data for comparison
             results = {
                 "metadata": {
                     "proj_id": chictr_id,
@@ -65,7 +67,7 @@ async def get_chictr_data_async(chictr_id):
                 "fields": {}
             }
 
-            # Field Extraction
+            # Map fields
             for row in soup.find_all('tr'):
                 label_cell = row.find('td', class_='left_title')
                 if label_cell:
@@ -96,10 +98,9 @@ async def get_chictr_data_async(chictr_id):
         except Exception as e:
             return None, str(e)
 
-# --- DATABASE HANDLERS ---
+# --- DB HELPERS ---
 def handle_sync_process(chictr_id):
-    """Manages the scraping and database upsert logic."""
-    with st.spinner("⚡ Fetching live data and updating database..."):
+    with st.spinner("⚡ Fetching live data from ChiCTR..."):
         scraped_data, error = asyncio.run(get_chictr_data_async(chictr_id))
         
         if error:
@@ -112,7 +113,7 @@ def handle_sync_process(chictr_id):
                     cur.execute("SELECT id FROM monitored_trials WHERE chictr_id = %s", (chictr_id,))
                     trial = cur.fetchone()
                     if not trial:
-                        st.error("This ID is not monitored. Please add it via SQL/Sidebar.")
+                        st.error("This ID is not in your monitored list.")
                         return False
                     
                     t_id = trial['id']
@@ -123,22 +124,18 @@ def handle_sync_process(chictr_id):
                     last_snap = cur.fetchone()
 
                     if last_snap and last_snap['content_hash'] == new_hash:
-                        st.info("✅ No protocol changes detected.")
+                        st.info("✅ Database is already up to date.")
                         return False
                     else:
-                        cur.execute("""
-                            INSERT INTO trial_snapshots (trial_id, raw_content, content_hash)
-                            VALUES (%s, %s, %s)
-                        """, (t_id, raw_text, new_hash))
+                        cur.execute("INSERT INTO trial_snapshots (trial_id, raw_content, content_hash) VALUES (%s, %s, %s)", (t_id, raw_text, new_hash))
                         conn.commit()
-                        st.success("🔔 New snapshot saved successfully!")
+                        st.success("🔔 New snapshot saved!")
                         return True
         except Exception as e:
             st.error(f"Database error: {e}")
             return False
 
 def get_recent_versions(chictr_id):
-    """Retrieves the history for Red/Green diffing."""
     with psycopg2.connect(DB_URL) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -151,24 +148,23 @@ def get_recent_versions(chictr_id):
             return cur.fetchall()
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="ChiCTR Intel", layout="wide")
-st.title("🧪 Clinical Trial Intelligence Monitor")
+st.set_page_config(page_title="ChiCTR HEOR Tracker", layout="wide")
+st.title("🧪 ChiCTR Clinical Trial Intelligence")
 
-selected_id = st.text_input("ChiCTR ID", value="297646")
+target_id = st.text_input("Enter ChiCTR ID", value="297646")
+c1, c2, _ = st.columns([1, 1, 4])
 
-col1, col2, _ = st.columns([1, 1, 4])
+with c1:
+    if st.button("🔍 Sync & Save"):
+        handle_sync_process(target_id)
 
-with col1:
-    if st.button("🔍 Sync Data"):
-        handle_sync_process(selected_id)
-
-with col2:
+with c2:
     if st.button("📜 View Changes"):
-        history = get_recent_versions(selected_id)
+        history = get_recent_versions(target_id)
         if len(history) < 2:
-            st.warning("Insufficient data for comparison.")
+            st.warning("Insufficient history for comparison.")
         else:
-            st.subheader(f"Comparison: {history[1]['scraped_at'].strftime('%Y-%m-%d')} vs Current")
+            st.subheader(f"Diff: {history[1]['scraped_at'].strftime('%Y-%m-%d')} vs Today")
             old_lines = json.dumps(json.loads(history[1]['raw_content']), indent=2).splitlines()
             new_lines = json.dumps(json.loads(history[0]['raw_content']), indent=2).splitlines()
             diff_html = difflib.HtmlDiff().make_file(old_lines, new_lines, context=True)
@@ -182,7 +178,7 @@ with st.sidebar:
                 cur.execute("SELECT chictr_id, trial_name FROM monitored_trials")
                 for item in cur.fetchall():
                     st.write(f"**{item['chictr_id']}**")
-                    st.caption(item['trial_name'] if item['trial_name'] else "Unnamed Study")
+                    st.caption(item['trial_name'] or "Unnamed Study")
                     st.divider()
     except:
-        st.write("Database connecting...")
+        st.write("Connecting...")
