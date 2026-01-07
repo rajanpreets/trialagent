@@ -1,6 +1,5 @@
 streamlit
-playwright>=1.49.0
-playwright-stealth
+playwright>=1.40.0
 psycopg2-binary
 beautifulsoup4
 nest_asyncio
