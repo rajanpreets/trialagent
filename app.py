@@ -10,26 +10,25 @@ from psycopg2.extras import RealDictCursor
 import difflib
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth
 import nest_asyncio
 
-# Setup for Streamlit's internal event loop
+# Initialize nested asyncio for Streamlit's environment
 nest_asyncio.apply()
 
-# --- DATABASE CONFIG ---
-# Connection string for your Neon Database
+# --- DATABASE CONFIGURATION ---
+# Neon PostgreSQL Connection String
 DB_URL = "postgresql://neondb_owner:npg_XU5awkQ1FOZW@ep-falling-field-adfv4ciy-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
 def ensure_playwright_browsers():
-    """Automatically installs Chromium if it's missing in the cloud environment."""
+    """Checks and installs Chromium if missing in cloud environments."""
     try:
-        # Check if browser binaries are already available
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception as e:
-        st.error(f"Playwright Browser Install Failed: {e}")
+        st.error(f"Browser installation check failed: {e}")
 
 async def get_chictr_data_async(chictr_id):
-    """The 'Ditto' v3 Scraper logic adjusted for async compatibility."""
+    """Scraper logic using standard stealth integration."""
     ensure_playwright_browsers()
     url = f"https://www.chictr.org.cn/showprojEN.html?proj={chictr_id}"
     
@@ -43,8 +42,8 @@ async def get_chictr_data_async(chictr_id):
         )
         page = await context.new_page()
         
-        # FIX: Correctly await the async stealth function
-        await stealth_async(page)
+        # Apply stealth to bypass bot detection
+        stealth(page)
         
         try:
             await page.goto(url, wait_until="networkidle", timeout=60000)
@@ -52,11 +51,11 @@ async def get_chictr_data_async(chictr_id):
             await browser.close()
             
             soup = BeautifulSoup(html_content, 'html.parser')
-            # Remove Chinese text tags
+            # Clean Chinese text tags
             for cn_tag in soup.find_all(class_='cn'): 
                 cn_tag.decompose()
 
-            # Data structure for Neon DB and Diffing
+            # Structure data for comparison
             results = {
                 "metadata": {
                     "proj_id": chictr_id,
@@ -66,7 +65,7 @@ async def get_chictr_data_async(chictr_id):
                 "fields": {}
             }
 
-            # Field Extraction Logic
+            # Field Extraction
             for row in soup.find_all('tr'):
                 label_cell = row.find('td', class_='left_title')
                 if label_cell:
@@ -88,7 +87,7 @@ async def get_chictr_data_async(chictr_id):
             results["fields"]["Primary outcome"] = "\n".join(primary_outcomes) if primary_outcomes else "Not Found"
             results["fields"]["Secondary outcome"] = "\n".join(secondary_outcomes) if secondary_outcomes else "Not Found"
 
-            # Sample Size Number Extraction
+            # Sample Size
             sample_size_matches = re.findall(r'Sample size\s*：\s*(\d+)', html_content)
             if sample_size_matches:
                 results["fields"]["Target Sample Size"] = sample_size_matches[0]
@@ -99,9 +98,8 @@ async def get_chictr_data_async(chictr_id):
 
 # --- DATABASE HANDLERS ---
 def handle_sync_process(chictr_id):
-    """Orchestrates scraping and database upsert."""
-    with st.spinner("⚡ Fetching live data from ChiCTR..."):
-        # Run the async scraper inside the Streamlit loop
+    """Manages the scraping and database upsert logic."""
+    with st.spinner("⚡ Fetching live data and updating database..."):
         scraped_data, error = asyncio.run(get_chictr_data_async(chictr_id))
         
         if error:
@@ -111,23 +109,21 @@ def handle_sync_process(chictr_id):
         try:
             with psycopg2.connect(DB_URL) as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    # Match schema: checked chictr_id
                     cur.execute("SELECT id FROM monitored_trials WHERE chictr_id = %s", (chictr_id,))
                     trial = cur.fetchone()
                     if not trial:
-                        st.error("This ID is not in your monitored list. Please add it via SQL first.")
+                        st.error("This ID is not monitored. Please add it via SQL/Sidebar.")
                         return False
                     
                     t_id = trial['id']
                     new_hash = scraped_data['metadata']['hash']
-                    raw_text = json.dumps(scraped_data['fields']) # Save structured fields as text for diffing
+                    raw_text = json.dumps(scraped_data['fields'])
 
-                    # Check for updates
                     cur.execute("SELECT content_hash FROM trial_snapshots WHERE trial_id = %s ORDER BY scraped_at DESC LIMIT 1", (t_id,))
                     last_snap = cur.fetchone()
 
                     if last_snap and last_snap['content_hash'] == new_hash:
-                        st.info("✅ Database is up to date. No protocol changes detected.")
+                        st.info("✅ No protocol changes detected.")
                         return False
                     else:
                         cur.execute("""
@@ -135,14 +131,14 @@ def handle_sync_process(chictr_id):
                             VALUES (%s, %s, %s)
                         """, (t_id, raw_text, new_hash))
                         conn.commit()
-                        st.success("🔔 New version saved to snapshots!")
+                        st.success("🔔 New snapshot saved successfully!")
                         return True
         except Exception as e:
             st.error(f"Database error: {e}")
             return False
 
 def get_recent_versions(chictr_id):
-    """Retrieves the two latest versions for comparison."""
+    """Retrieves the history for Red/Green diffing."""
     with psycopg2.connect(DB_URL) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -154,34 +150,30 @@ def get_recent_versions(chictr_id):
             """, (chictr_id,))
             return cur.fetchall()
 
-# --- STREAMLIT DASHBOARD ---
-st.set_page_config(page_title="ChiCTR HEOR Intel", layout="wide")
-st.title("🧪 ChiCTR Clinical Trial Intelligence")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="ChiCTR Intel", layout="wide")
+st.title("🧪 Clinical Trial Intelligence Monitor")
 
-selected_id = st.text_input("Enter ChiCTR ID (e.g., 297646)", value="297646")
+selected_id = st.text_input("ChiCTR ID", value="297646")
 
-col_btn1, col_btn2, _ = st.columns([1, 1, 4])
+col1, col2, _ = st.columns([1, 1, 4])
 
-with col_btn1:
-    if st.button("🔍 Sync & Save"):
+with col1:
+    if st.button("🔍 Sync Data"):
         handle_sync_process(selected_id)
 
-with col_btn2:
+with col2:
     if st.button("📜 View Changes"):
         history = get_recent_versions(selected_id)
         if len(history) < 2:
-            st.warning("Insufficient history to generate a Red/Green comparison.")
+            st.warning("Insufficient data for comparison.")
         else:
-            st.subheader(f"Comparison: {history[1]['scraped_at'].strftime('%Y-%m-%d')} vs Today")
-            
-            # Format JSON text back into lines for the HTML Diff engine
+            st.subheader(f"Comparison: {history[1]['scraped_at'].strftime('%Y-%m-%d')} vs Current")
             old_lines = json.dumps(json.loads(history[1]['raw_content']), indent=2).splitlines()
             new_lines = json.dumps(json.loads(history[0]['raw_content']), indent=2).splitlines()
-
             diff_html = difflib.HtmlDiff().make_file(old_lines, new_lines, context=True)
             st.components.v1.html(diff_html, height=800, scrolling=True)
 
-# Sidebar: Registry Explorer
 with st.sidebar:
     st.header("📊 Monitoring Portfolio")
     try:
@@ -193,4 +185,4 @@ with st.sidebar:
                     st.caption(item['trial_name'] if item['trial_name'] else "Unnamed Study")
                     st.divider()
     except:
-        st.write("Awaiting database connection...")
+        st.write("Database connecting...")
