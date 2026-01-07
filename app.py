@@ -1,254 +1,146 @@
 import streamlit as st
-import pandas as pd
-import faiss
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import os
+import asyncio
+import hashlib
 import json
 import re
-from groq import Groq
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, List, Optional
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import difflib
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth
+import nest_asyncio
 
-# --- 1. CONFIGURATION ---
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-    client = Groq(api_key=GROQ_API_KEY)
-except (KeyError, FileNotFoundError):
-    st.error("Groq API Key not found. Please add it to your Streamlit secrets.")
-    st.stop()
+# Initialize nested asyncio for Streamlit
+nest_asyncio.apply()
+
+# --- CONFIGURATION & DATABASE CONNECTION ---
+# Using the Neon Connection String provided
+DB_URL = "postgresql://neondb_owner:npg_XU5awkQ1FOZW@ep-falling-field-adfv4ciy-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
+
+# --- CORE SCRAPER (DITTO V3 LOGIC) ---
+async def get_chictr_data(chictr_id):
+    url = f"https://www.chictr.org.cn/showprojEN.html?proj={chictr_id}"
     
-EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-LLM_MODEL_NAME = 'openai/gpt-oss-120b'
-
-# --- 2. DATA AND MODEL LOADING ---
-@st.cache_resource
-def load_models_and_data(faiss_file_obj, metadata_file_obj):
-    temp_dir = "temp_data"
-    os.makedirs(temp_dir, exist_ok=True)
-    faiss_path = os.path.join(temp_dir, faiss_file_obj.name)
-    metadata_path = os.path.join(temp_dir, metadata_file_obj.name)
-    with open(faiss_path, "wb") as f: f.write(faiss_file_obj.getbuffer())
-    with open(metadata_path, "wb") as f: f.write(metadata_file_obj.getbuffer())
-    with st.spinner("Loading models and search index..."):
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        search_index = faiss.read_index(faiss_path)
-        metadata_df = pd.read_csv(metadata_path)
-    return embedding_model, search_index, metadata_df
-
-# --- 3. THE UNRESTRICTED RETRIEVER TOOL ---
-def search_clinical_trials(query: str, filters: dict):
-    embedding_model, search_index, metadata_df = st.session_state.models_and_data
-    working_df = metadata_df
-
-    if filters:
-        for column, value in filters.items():
-            actual_col = next((c for c in metadata_df.columns if column in c.lower()), None)
-            if actual_col and value:
-                if isinstance(value, list):
-                    pattern = '|'.join(map(re.escape, value))
-                    if not pattern: continue
-                else:
-                    pattern = re.escape(str(value))
-                working_df = working_df[working_df[actual_col].str.contains(pattern, case=False, na=False, regex=True)]
-
-    if working_df.empty:
-        return pd.DataFrame()
-
-    if query:
-        filtered_indices = working_df.index.to_numpy()
-        query_vector = embedding_model.encode([query]).astype('float32')
-        distances, all_indices = search_index.search(query_vector, k=search_index.ntotal)
-        ranked_filtered_indices = [idx for idx in all_indices[0] if idx in filtered_indices]
-        results_df = metadata_df.iloc[ranked_filtered_indices]
-    else:
-        results_df = working_df
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = await context.new_page()
+        await stealth(page)
         
-    return results_df
-
-# --- 4. LANGGRAPH AGENT SETUP ---
-class AgentState(TypedDict):
-    question: str
-    k_summarize: int
-    plan: dict
-    retrieved_df: Optional[pd.DataFrame]
-    total_found: int
-    batch_summaries: List[str]
-    final_answer: str
-    current_batch: int
-
-# --- Agent Nodes ---
-def planner_node(state: AgentState):
-    """
-    Decomposes the user query and robustly extracts the JSON plan.
-    This version is highly defensive against malformed AI responses.
-    """
-    prompt = f"""You are a query analysis expert. Your job is to break down a user's question about clinical trials into a semantic search query and structured filters.
-
-    Identify filters like: sponsor, status, phase. The status "ongoing" can mean ["Recruiting", "Active, not recruiting", "Enrolling by invitation"]. The rest is the semantic query.
-
-    User Question: "{state['question']}"
-
-    CRITICAL: Your entire response must be ONLY the raw JSON object and nothing else. Do not include any introductory text, explanations, or markdown code fences like ```json.
-    """
-    
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME, temperature=0, response_format={"type": "json_object"},
-        )
-        response_text = chat_completion.choices[0].message.content
-        
-        # --- Defensive JSON Parsing ---
-        # Find the first '{' and the last '}' to extract the JSON object
-        start_index = response_text.find('{')
-        end_index = response_text.rfind('}') + 1
-        
-        if start_index == -1 or end_index == 0:
-            raise ValueError(f"No JSON object found in the LLM response. Raw response: {response_text}")
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            html_content = await page.content()
+            await browser.close()
             
-        json_text = response_text[start_index:end_index]
-        plan = json.loads(json_text)
-        return {"plan": plan}
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # Clean Chinese text
+            for cn_tag in soup.find_all(class_='cn'): 
+                cn_tag.decompose()
 
-    except Exception as e:
-        # Re-raise the exception to be caught by the main error handler
-        print(f"FATAL: Planner node failed with error: {e}")
-        raise e
+            # Extract text for hashing and storage
+            raw_text = soup.get_text("\n", strip=True)
+            content_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+            
+            return raw_text, content_hash
+        except Exception as e:
+            return None, str(e)
 
-
-def retrieve_node(state: AgentState):
-    """Retrieves ALL documents based on the plan."""
-    results_df = search_clinical_trials(
-        query=state["plan"].get("query", ""),
-        filters=state["plan"].get("filters", {})
-    )
-    return {"retrieved_df": results_df, "total_found": len(results_df)}
-
-def batch_summarize_node(state: AgentState):
-    """Summarizes one batch of the TOP k_summarize results."""
-    df_to_summarize = state["retrieved_df"].head(state["k_summarize"])
-    start_index = state["current_batch"] * 5
-    end_index = start_index + 5
-    batch_df = df_to_summarize.iloc[start_index:end_index]
+# --- DATABASE OPERATIONS ---
+def handle_sync(chictr_id):
+    """Scrapes data and saves to Neon if hash is different."""
+    raw_content, new_hash = asyncio.run(get_chictr_data(chictr_id))
     
-    if batch_df.empty:
-        return {"batch_summaries": state.get("batch_summaries", [])}
+    if not raw_content:
+        st.error(f"Scrape failed: {new_hash}")
+        return False
 
-    context = "\n---\n".join([f"Trial {start_index + i + 1}:\n{row.to_string()}" for i, row in batch_df.iterrows()])
-    prompt = f"Summarize the key findings from the following batch of clinical trials:\n\n{context}"
-    
-    chat_completion = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME)
-    summary = chat_completion.choices[0].message.content
-    
-    new_summaries = state.get("batch_summaries", []) + [summary]
-    return {"batch_summaries": new_summaries, "current_batch": state["current_batch"] + 1}
+    with psycopg2.connect(DB_URL) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get the record ID from monitored_trials
+            cur.execute("SELECT id FROM monitored_trials WHERE chictr_id = %s", (chictr_id,))
+            trial = cur.fetchone()
+            
+            if not trial:
+                st.error("This ID is not in your monitored list. Please add it first.")
+                return False
+            
+            internal_id = trial['id']
 
-def final_summary_node(state: AgentState):
-    """Creates a final summary that reports the total count and summarizes the top results."""
-    if not state.get("batch_summaries"):
-        return {"final_answer": "No relevant trials were found based on your query."}
-        
-    context = "\n\n".join(state["batch_summaries"])
-    prompt = f"""You are a professional clinical research assistant.
-    
-    First, state the TOTAL number of trials found, which is {state['total_found']}.
-    
-    Then, synthesize the following batch summaries into a single, cohesive final answer for the user's original question. Explain the key themes and provide details for the most relevant trials discussed.
+            # Check the latest snapshot in the database
+            cur.execute("""
+                SELECT content_hash FROM trial_snapshots 
+                WHERE trial_id = %s ORDER BY scraped_at DESC LIMIT 1
+            """, (internal_id,))
+            last_snap = cur.fetchone()
 
-    User Question: "{state['question']}"
+            if last_snap and last_snap['content_hash'] == new_hash:
+                st.info("✅ Database is already up to date. No changes found.")
+                return False
+            else:
+                cur.execute("""
+                    INSERT INTO trial_snapshots (trial_id, raw_content, content_hash)
+                    VALUES (%s, %s, %s)
+                """, (internal_id, raw_content, new_hash))
+                conn.commit()
+                st.success("🔔 Protocol update detected! New version saved.")
+                return True
 
-    Summaries of the top {state['k_summarize']} trials:
-    {context}
-    """
-    chat_completion = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=LLM_MODEL_NAME)
-    final_summary = chat_completion.choices[0].message.content
-    return {"final_answer": final_summary}
-
-# --- Conditional Edges & Graph Definition ---
-def should_summarize(state: AgentState):
-    return "end" if state["retrieved_df"] is None or state["retrieved_df"].empty else "summarize"
-
-def more_batches(state: AgentState):
-    if state["current_batch"] * 5 >= state["k_summarize"] or state["current_batch"] * 5 >= state["total_found"]:
-        return "to_final_summary"
-    else:
-        return "continue_batching"
-
-workflow = StateGraph(AgentState)
-workflow.add_node("planner", planner_node)
-workflow.add_node("retriever", retrieve_node)
-workflow.add_node("batch_summarizer", batch_summarize_node)
-workflow.add_node("final_summarizer", final_summary_node)
-workflow.set_entry_point("planner")
-workflow.add_edge("planner", "retriever")
-workflow.add_conditional_edges("retriever", should_summarize, {"end": END, "summarize": "batch_summarizer"})
-workflow.add_conditional_edges("batch_summarizer", more_batches, {"to_final_summary": "final_summarizer", "continue_batching": "batch_summarizer"})
-workflow.add_edge("final_summarizer", END)
-app_graph = workflow.compile()
+def fetch_comparison(chictr_id):
+    """Returns the two most recent versions for diffing."""
+    with psycopg2.connect(DB_URL) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT s.raw_content, s.scraped_at 
+                FROM trial_snapshots s
+                JOIN monitored_trials m ON s.trial_id = m.id
+                WHERE m.chictr_id = %s
+                ORDER BY s.scraped_at DESC LIMIT 2
+            """, (chictr_id,))
+            return cur.fetchall()
 
 # --- STREAMLIT UI ---
-st.set_page_config(layout="wide")
-st.title("Advanced Clinical Trials Research Assistant 🔬")
-st.info("Powered by LangGraph and Groq (Llama3-8B)")
+st.set_page_config(page_title="ChiCTR HEOR Intel", layout="wide")
 
-st.sidebar.header("1. Upload Your Data")
-faiss_file = st.sidebar.file_uploader("Upload FAISS Index", type=["faiss"])
-csv_file = st.sidebar.file_uploader("Upload CSV Metadata", type=["csv"])
+st.markdown("# 🧪 ChiCTR Clinical Trial Monitor")
+st.write("Real-time monitoring and Red/Green diffing for Chinese registries.")
 
-if faiss_file and csv_file:
-    st.sidebar.header("2. Search Settings")
-    k_summarize_results = st.sidebar.slider("Number of top trials to summarize:", 1, 50, 10)
-    
-    if 'models_and_data' not in st.session_state:
-        st.session_state.models_and_data = load_models_and_data(faiss_file, csv_file)
-    st.sidebar.success("Data loaded!")
+# Target ID Input
+target_id = st.text_input("Enter ChiCTR ID (e.g., 297646)", value="297646")
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.retrieved_data = None
+action_cols = st.columns([1, 1, 4])
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+with action_cols[0]:
+    if st.button("🔍 Sync Data"):
+        handle_sync(target_id)
 
-    if prompt := st.chat_input("Ask a complex question about clinical trials..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
+with action_cols[1]:
+    if st.button("📜 Show Diff"):
+        history = fetch_comparison(target_id)
+        if len(history) < 2:
+            st.warning("Comparison requires at least two historical snapshots.")
+        else:
+            st.subheader(f"Changes Detected since {history[1]['scraped_at'].strftime('%Y-%m-%d')}")
+            
+            # Generate the Red/Green HTML
+            diff_engine = difflib.HtmlDiff()
+            diff_html = diff_engine.make_file(
+                history[1]['raw_content'].splitlines(),
+                history[0]['raw_content'].splitlines(),
+                context=True,
+                numlines=3
+            )
+            st.components.v1.html(diff_html, height=800, scrolling=True)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Performing comprehensive search and analysis..."):
-                try:
-                    inputs = {"question": prompt, "k_summarize": k_summarize_results, "current_batch": 0}
-                    final_state = app_graph.invoke(inputs)
-                    response = final_state.get("final_answer", "An error occurred.")
-                    st.session_state.retrieved_data = final_state.get("retrieved_df")
-                    st.markdown(response)
-                except Exception as e:
-                    st.error(f"An error occurred during the agent run: {e}")
-                    print(f"An error occurred: {e}")
-        
-        if 'response' in locals() and response:
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
-
-    if st.session_state.get("retrieved_data") is not None and not st.session_state.retrieved_data.empty:
-        st.markdown("---")
-        st.subheader(f"Retrieved Trial Details (Top {k_summarize_results} of {len(st.session_state.retrieved_data)} shown)")
-        
-        @st.cache_data
-        def convert_df_to_csv(df):
-            return df.to_csv(index=False).encode('utf-8')
-        
-        csv_data = convert_df_to_csv(st.session_state.retrieved_data)
-        st.download_button(
-            label=f"Download All {len(st.session_state.retrieved_data)} Results as CSV",
-            data=csv_data,
-            file_name="clinical_trial_results.csv",
-            mime="text/csv",
-        )
-        
-        for index, row in st.session_state.retrieved_data.head(k_summarize_results).iterrows():
-            with st.expander(f"**{row.get('protocolSection.identificationModule.nctId', 'N/A')}**: {row.get('protocolSection.identificationModule.officialTitle', 'N/A')}"):
-                st.dataframe(row)
-else:
-    st.info("Please upload your data files in the sidebar to begin.")
+# Sidebar: Monitored Trials List
+with st.sidebar:
+    st.header("Monitored Trials")
+    try:
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT chictr_id, trial_name FROM monitored_trials")
+                for trial in cur.fetchall():
+                    st.markdown(f"**{trial['chictr_id']}** \n*{trial['trial_name']}*")
+                    st.divider()
+    except:
+        st.write("Database connecting...")
