@@ -1,5 +1,5 @@
 streamlit
-playwright
+playwright>=1.49.0
 playwright-stealth
 psycopg2-binary
 beautifulsoup4
